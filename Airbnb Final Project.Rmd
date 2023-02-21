@@ -1,0 +1,388 @@
+---
+title: "Final Model"
+output: html_document
+date: '2022-04-28'
+---
+
+### Importing the libraries
+
+```{r}
+library(dplyr)
+library(stringr)
+library(caret)
+library(randomForest)
+library(glmnet)
+library(tidyr)
+```
+
+### INITIAL EXPLORATION 
+
+#### Reading the Dataset and Data Understanding
+
+```{r}
+train <- read.csv('analysisData.csv')
+test <- read.csv('scoringData.csv')
+
+View(train)
+str(train) #understand the variables' data types
+summary(train)
+dim(train) #view the dimension 
+
+print(mean(train$price))
+
+```
+
+### DATA CLEANING 
+
+#### Train Data Cleaning
+
+```{r}
+# 1. removing irrelevant columns and columns with lot of categories
+train <- train %>%
+            select(-id, -name, -summary, -space, -description, -neighborhood_overview, 
+                   -notes, -transit, -access, -interaction, -house_rules, -host_name,
+                   -host_location, -host_about, -host_acceptance_rate, -host_neighbourhood,
+                   -host_verifications, -street, -neighbourhood, -neighbourhood_cleansed,
+                   -city, -state, -zipcode, -market, -smart_location, -country_code,
+                   -country, -property_type, -amenities, -weekly_price, -monthly_price,
+                   -calendar_updated, -has_availability, -license, -jurisdiction_names,
+                   -is_business_travel_ready, -host_response_time, -host_total_listings_count,
+                   -host_has_profile_pic, -square_feet, -requires_license)
+
+# Viewing the resulting dataframe
+View(train)
+# Viewing the summary statistic of the dataframe
+summary(train)
+
+# 2. Removing rows containing NA values for host_is_superhost, host_listings_count, host_identity_verified, beds
+train <- train[train$host_is_superhost != '',]
+train <- train[!is.na(train$host_listings_count),]
+train <- train[train$host_identity_verified != '',]
+train <- train[!is.na(train$beds),]
+
+# 3. Replacing the host_since column by the difference in the numbers from 2022 to the actual date value of host_since
+train$host_since <- 2022 - as.integer(format(as.POSIXct(train$host_since, format = '%Y-%m-%d'), format = '%Y')) 
+
+# 4. Converting the host_response_rate column into a numerical feature
+train$host_response_rate <- as.numeric(str_replace(train$host_response_rate, '%', ''))
+train[is.na(train$host_response_rate), 'host_response_rate'] <- mean(train$host_response_rate, na.rm = TRUE) 
+
+# 5. Imputing the NA values for the columns: security_deposit, cleaning_fee and reviews_per_month by the respective column means
+train[is.na(train$security_deposit), 'security_deposit'] <- mean(train$security_deposit, na.rm = TRUE)
+train[is.na(train$cleaning_fee), 'cleaning_fee'] <- mean(train$cleaning_fee, na.rm = TRUE)
+train[is.na(train$reviews_per_month), 'reviews_per_month'] <- mean(train$reviews_per_month, na.rm = TRUE)
+
+# 6. Creating a new column 'last_first_review' as the difference of the number of days betweek last review and 1st review.
+train$last_fist_review <- as.Date(train$last_review) - as.Date(train$first_review)
+
+# 7. Deleting the columns: first_review and last_review
+train <- train %>%
+          select(-first_review, -last_review) %>%
+          na.omit(train)
+```
+
+#### Test Data Cleaning
+
+```{r}
+# 1. removing irrelevant columns and columns with lot of categories
+test <- test %>%
+            select(-id, -name, -summary, -space, -description, -neighborhood_overview, 
+                   -notes, -transit, -access, -interaction, -house_rules, -host_name,
+                   -host_location, -host_about, -host_acceptance_rate, -host_neighbourhood,
+                   -host_verifications, -street, -neighbourhood, -neighbourhood_cleansed,
+                   -city, -state, -zipcode, -market, -smart_location, -country_code,
+                   -country, -property_type, -amenities, -weekly_price, -monthly_price,
+                   -calendar_updated, -has_availability, -license, -jurisdiction_names,
+                   -is_business_travel_ready, -host_response_time, -host_total_listings_count,
+                   -host_has_profile_pic, -square_feet, -requires_license)
+
+
+# 2. Removing rows containing NA values for host_is_superhost, host_listings_count, host_identity_verified, beds
+test[test$host_is_superhost == '', 'host_is_superhost'] <- names(sort(-table(train$host_is_superhost)))[1]
+
+test[is.na(test$host_listings_count), 'host_listings_count'] <- mean(train$host_listings_count, na.rm = TRUE)
+
+test[test$host_identity_verified == '', 'host_identity_verified'] <- names(sort(-table(train$host_identity_verified)))[1]
+
+test[is.na(test$beds), 'beds'] <- mean(train$beds, na.rm = TRUE)
+
+
+# 3. Replacing the host_since column by the difference in the numbers from 2022 to the actual date value of host_since
+test$host_since <- 2022 - as.integer(format(as.POSIXct(test$host_since, format = '%Y-%m-%d'), format = '%Y'))
+test[is.na(test$host_since), 'host_since'] <- mean(train$host_since, na.rm = TRUE)
+
+# 4. Converting the host_response_rate column into a numerical feature
+test$host_response_rate <- as.numeric(str_replace(test$host_response_rate, '%', ''))
+test[is.na(test$host_response_rate), 'host_response_rate'] <- mean(train$host_response_rate, na.rm = TRUE) 
+
+# 5. Imputing the NA values for the columns: security_deposit, cleaning_fee and reviews_per_month by the respective column means
+test[is.na(test$security_deposit), 'security_deposit'] <- mean(train$security_deposit, na.rm = TRUE)
+test[is.na(test$cleaning_fee), 'cleaning_fee'] <- mean(train$cleaning_fee, na.rm = TRUE)
+test[is.na(test$reviews_per_month), 'reviews_per_month'] <- mean(train$reviews_per_month, na.rm = TRUE)
+
+# 6. Creating a new column 'last_first_review' as the difference of the number of days betweek last review and 1st review.
+test$last_fist_review <- as.Date(test$last_review) - as.Date(test$first_review)
+
+# 7. Deleting the columns: first_review and last_review
+test <- test %>%
+          select(-first_review, -last_review)
+```
+
+### Modelling
+
+#### 80-20 Train-Test Split
+
+```{r}
+sample_split <- sample(nrow(train), nrow(train)*0.8)
+train_data <- train[sample_split,]
+test_data <- train[-sample_split,]
+```
+
+#### Training the Linear Regression Model
+
+```{r}
+model1 <- lm(price ~., data = train_data)
+summary(model1)
+```
+
+#### Training the Lasso Model 
+
+```{r}
+lasso_reg <- cv.glmnet(data.matrix(train_data %>% select(-price)), train_data$price, alpha = 1, lambda = lambdas <- 10^seq(2, -3, by = -.1), standardize = TRUE, nfolds = 3)
+lasso_reg
+
+lambda_best <- lasso_reg$lambda.min 
+lambda_best
+
+model2 <- glmnet(data.matrix(train_data %>% select(-price)), train_data$price, alpha = 1, lambda = lambda_best, standardize = TRUE)
+```
+
+#### Training the Random Forest Regression Model using Grid Search
+
+```{r}
+model3 <- randomForest(price~neighbourhood_group_cleansed
+                          +bathrooms+bedrooms+accommodates
+                          +guests_included +room_type+number_of_reviews 
+                          +calculated_host_listings_count_private_rooms
+                          +availability_365+availability_90
+                          +cleaning_fee+host_since+calculated_host_listings_count
+                          + host_listings_count, data = train_data,
+                         ntree = 100,mtry = 3)
+```
+
+#### Training the XGBOOST model
+
+```{r}
+set.seed(123)
+trControl <- trainControl(method  = "cv",
+                          number  = 3)
+
+gbmGrid <-  expand.grid(max_depth = c(3, 5, 7), 
+                        nrounds = (1:10)*50,    # number of trees
+                        # default values below
+                        eta = 0.3,
+                        gamma = 0,
+                        subsample = 1,
+                        min_child_weight = 1,
+                        colsample_bytree = 0.6)
+
+model4 <- train(price ~ .,
+                   method     = "xgbTree",
+                   tuneGrid   = gbmGrid,
+                   trControl  = trControl,
+                   metric     = "RMSE",
+                   data       = train_data)
+print(model4)
+```
+
+#evaluate on training data
+
+```{r}
+pred_train1 = predict(model1, newdata = train_data)
+pred_train2 = predict(model2, newx = data.matrix(train_data %>% select(-price)))
+pred_train3 = predict(model3, newdata = train_data)
+pred_train4 = predict(model4, newdata = train_data)
+```
+
+#Root Mean Square Error (train data)
+
+```{r}
+rmse1 = sqrt(mean((pred_train1-train_data$price)^2))
+rmse2 = sqrt(mean((pred_train2-train_data$price)^2))
+rmse3 = sqrt(mean((pred_train3-train_data$price)^2))
+rmse4 = sqrt(mean((pred_train4-train_data$price)^2))
+
+print('rmse of models on the training data is (in order of the models in the code):')
+print(c(rmse1, rmse2, rmse3, rmse4))
+```
+
+# Apply model to generate predictions (Prediction on test data)
+
+```{r}
+pred1 = predict(model1, newdata = test_data)
+pred2 = predict(model2, newx = data.matrix(test_data %>% select(-price)))
+pred3 = predict(model3, newdata = test_data)
+pred4 = predict(model4, newdata = test_data)
+```
+
+#Root Mean Square Error (test data)
+
+```{r}
+rmse_pred1 = sqrt(mean((pred1-test_data$price)^2))
+rmse_pred2 = sqrt(mean((pred2-test_data$price)^2))
+rmse_pred3 = sqrt(mean((pred3-test_data$price)^2))
+rmse_pred4 = sqrt(mean((pred4-test_data$price)^2))
+
+print('rmse of models on the training data is (in order of the models in the code):')
+print(c(rmse_pred1, rmse_pred2, rmse_pred3, rmse_pred4))
+```
+
+### MODELING WORK END
+
+### Construct submission from predictions
+
+```{r}
+submissionFile = data.frame(id = scoringData$id, price = pred1)
+write.csv(submissionFile, 'LinearRegression.csv',row.names = F)
+submissionFile = data.frame(id = scoringData$id, price = pred2)
+write.csv(submissionFile, 'Lasso.csv',row.names = F)
+submissionFile = data.frame(id = scoringData$id, price = pred3)
+write.csv(submissionFile, 'RandomForest.csv',row.names = F)
+submissionFile4 = data.frame(id = scoringData$id, price = pred4)
+write.csv(submissionFile, 'XGBOOST.csv',row.names = F)
+```
+
+### Exploratory Data Analysis + Data Virtualization
+
+1. Relationship between accommodates and housing price
+
+```{r}
+train %>%
+  group_by(accommodates) %>%
+  summarise(mean_price = mean(price)) %>%
+  ggplot(aes(x = accommodates, y = mean_price)) +
+  geom_line()
+```
+
+
+If the house has accommodation for more people, the price of the house has an increasing trend on an average, but there are exceptions for houses having accommodations for 11 people and for those for 14 people.
+
+
+2. Relationship between cleaning fee and housing price
+
+```{r}
+train %>%
+  group_by(cleaning_fee) %>%
+  summarise(mean_price = mean(price)) %>%
+  ggplot(aes(x = cleaning_fee, y = mean_price)) +
+  geom_point()
+```
+
+
+If the cleaning fee is on a higher end, definitely the average housing price increases almost linearly.
+
+
+3. Relationship between bedrooms and housing price
+
+```{r}
+train %>%
+  group_by(bedrooms) %>%
+  summarise(mean_price = mean(price)) %>%
+  ggplot(aes(x = bedrooms, y = mean_price)) + 
+  geom_line()
+```
+
+
+With increase in the number of bedrooms, the price of the house increases on an average till 9 but for houses having more than 9 bedrooms have quite lower average price.
+
+
+4. Relationship between bathrooms and housing price
+
+```{r}
+train %>%
+  group_by(bathrooms) %>%
+  summarise(mean_price = mean(price)) %>%
+  ggplot(aes(x = bathrooms, y = mean_price)) +
+  geom_line()
+```
+
+
+With increase in the number of bathrooms, the average price of the house increases except the exceptions of houses containing 3, 4 and more than 5.
+
+
+5. Correlation Heat Map of Housing Price with top continuous features
+
+```{r}
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+
+train[is.na(train$cleaning_fee), 'cleaning_fee'] <- mean(train$cleaning_fee, na.rm = TRUE)
+correlation_df <- cor(train %>% select(accommodates, cleaning_fee, bedrooms, bathrooms, price))
+corrplot(correlation_df, method = 'color', col = col(200), addCoef.col = "black",
+         tl.col="black", tl.srt=45, number.cex = 0.75)
+```
+
+
+The highest to lowest positive correlation of the feature variables with the housing price is in the following order:
+
+accommodates > cleaning_fee > bedrooms > bathrooms
+
+
+6. Relationship between neighbourhood_group_cleansed and price
+
+```{r}
+train %>%
+  ggplot(aes(x = neighbourhood_group_cleansed, y = price)) +
+  geom_boxplot()
+```
+
+
+If the cleansing group of the neighbourhood is in Manhattan, then the median price of the house is on a higher end i.e., a little above 125. On the other hand, if the cleansing group is in the neighbourhood of Bronx/Queens/Staten Island, the median housing price is the lowest i.e., 125. Generally, if the cleansing group is from Staten Island, the maximum housing price (outlier) is 625 which is the lowest as compared to other neighbourhoods.
+
+
+### Feature Important 
+
+```{r}
+library(caret)
+
+vi_df = varImp(model_fit)[1]$importance
+
+vi_df_plot <- data.frame(feature = rownames(vi_df)[1:20],
+                         importance = vi_df$Overall[1:20])
+
+library(ggplot2)
+
+ggplot(data = vi_df_plot,
+       aes(x = importance, y = reorder(feature, importance))) + 
+  geom_bar(stat = 'identity') + 
+  xlab("Variable Importance") +
+  ylab("Variable")
+
+
+```
+
+
+### Model Comparison
+
+```{r}
+model_performance_df <- data.frame(
+                          `Model` = c('Linear Regression', 'Lasso Regression', 'Random Forest', 'XGBOOST'),
+                          `RMSE Training Data` = c(rmse1, rmse2, rmse3, rmse4),
+                          `RMSE Test Data` = c(rmse_pred1, rmse_pred2, rmse_pred3, rmse_pred4),
+                          `RMSE on Kaggle` = c(71.371, 77.542, 66.498, 62.497)
+                        )
+
+model_performance_df %>%
+  pivot_longer(cols = starts_with('RMSE'),
+               names_to = 'Type',
+               values_to = 'RMSE') %>%
+  ggplot(aes(x = Model, y = RMSE, fill = Type)) + 
+  geom_bar(stat = 'identity', position = 'dodge') + 
+  ggtitle('Predicting Rent in New York')
+
+```
+
+
+
+
+
+
